@@ -8,12 +8,39 @@ from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-
+from sqlalchemy.engine import URL
 load_dotenv()
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-me")
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-me-too")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "mysql+pymysql://root:password@localhost/ekantika_db?charset=utf8mb4")
+db_host = os.getenv("DB_HOST")
+
+if db_host:
+    app.config["SQLALCHEMY_DATABASE_URI"] = URL.create(
+        "mysql+pymysql",
+        username=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=db_host,
+        port=int(os.getenv("DB_PORT", "15231")),
+        database=os.getenv("DB_NAME", "defaultdb"),
+        query={"charset": "utf8mb4"},
+    )
+
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "connect_args": {
+            "ssl": {
+                "ca": os.path.join(
+                    os.path.dirname(__file__), "ca.pem"
+                )
+            }
+        }
+    }
+else:
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+        "DATABASE_URL",
+        "mysql+pymysql://root:password@localhost/ekantika_db?charset=utf8mb4"
+    )
+
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "uploads")
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
