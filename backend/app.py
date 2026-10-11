@@ -65,14 +65,79 @@ class Product(db.Model):
     color = db.Column(db.String(80), default="")
     image_filename = db.Column(db.String(255))
     available = db.Column(db.Boolean, default=True, nullable=False)
-
+    variants = db.relationship(
+        "ProductVariant",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        lazy=True
+    )
     def public(self):
         return {"id": self.id, "name": self.name, "price": float(self.price),
                 "description": self.description or "", "category": self.category or "Sarees",
                 "fabric": self.fabric or "", "color": self.color or "",
                 "image_url": f"/uploads/{self.image_filename}" if self.image_filename else None,
-                "available": self.available}
+                "available": self.available,
+                "variants": [variant.public() for variant in self.variants]}
+class ProductVariant(db.Model):
+    __tablename__ = "product_variants"
 
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(
+        db.Integer,
+        db.ForeignKey("product.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    color = db.Column(db.String(80), nullable=False)
+    description = db.Column(db.Text, default="")
+    available = db.Column(db.Boolean, default=True, nullable=False)
+
+    product = db.relationship(
+        "Product",
+        back_populates="variants"
+    )
+
+    images = db.relationship(
+        "VariantImage",
+        back_populates="variant",
+        cascade="all, delete-orphan",
+        order_by="VariantImage.id",
+        lazy=True
+    )
+
+    def public(self):
+        return {
+            "id": self.id,
+            "product_id": self.product_id,
+            "color": self.color,
+            "description": self.description or "",
+            "available": self.available,
+            "images": [
+                {
+                    "id": image.id,
+                    "image_url": f"/uploads/{image.image_filename}"
+                }
+                for image in self.images
+            ]
+        }
+
+
+class VariantImage(db.Model):
+    __tablename__ = "variant_images"
+
+    id = db.Column(db.Integer, primary_key=True)
+    variant_id = db.Column(
+        db.Integer,
+        db.ForeignKey("product_variants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    image_filename = db.Column(db.String(255), nullable=False)
+
+    variant = db.relationship(
+        "ProductVariant",
+        back_populates="images"
+    )
 class Setting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(db.String(80), unique=True, nullable=False)
@@ -200,17 +265,214 @@ def edit_product(pid):
             except OSError: pass
     db.session.commit()
     return jsonify(p.public())
+@app.post("/api/admin/products/<int:pid>/variants")
+@owner_only
+def add_variant(pid):
+    product = db.session.get(Product, pid)
+    if not product:
+        return fail("Product not found.", 404)
 
+    color = request.form.get("color", "").strip()
+    description = request.form.get("description", "").strip()
+    available = request.form.get("available", "true").lower() in {
+        "true", "1", "yes", "on"
+    }
+
+    if not color:
+        return fail("Colour name is required.")
+
+    files = [f for f in request.files.getlist("images") if f.filename]
+
+    if not files:
+        return fail("Upload at least one image for this colour.")
+
+    saved_files = []
+
+    try:
+        for file in files:
+            filename = save_image(file)
+            if filename:
+                saved_files.append(filename)
+
+        variant = ProductVariant(
+            product_id=pid,
+            color=color,
+            description=description,
+            available=available
+        )
+        db.session.add(variant)
+        db.session.flush()
+
+        for filename in saved_files:
+            db.session.add(
+                VariantImage(
+                    variant_id=variant.id,
+                    image_filename=filename
+                )
+            )
+
+        db.session.commit()
+        return jsonify(variant.public()), 201
+
+    except ValueError as e:
+        db.session.rollback()
+        for filename in saved_files:
+            try:
+                os.remove(os.path.join(
+                    app.config["UPLOAD_FOLDER"], filename
+                ))
+            except OSError:
+                pass
+        return fail(str(e))
+
+    except Exception:
+        db.session.rollback()
+        for filename in saved_files:
+            try:
+                os.remove(os.path.join(
+                    app.config["UPLOAD_FOLDER"], filename
+                ))
+            except OSError:
+                pass
+        app.logger.exception("Could not create product variant")
+        return fail("Could not save the colour variant.", 500)
+
+
+@app.put("/api/admin/variants/<int:vid>")
+@owner_only
+def edit_variant(vid):
+    variant = db.session.get(ProductVariant, vid)
+    if not variant:
+        return fail("Colour variant not found.", 404)
+
+    color = request.form.get("color", variant.color).strip()
+    description = request.form.get(
+        "description", variant.description or ""
+    ).strip()
+
+    if not color:
+        return fail("Colour name is required.")
+
+    if "available" in request.form:
+        available = request.form["available"].lower() in {
+            "true", "1", "yes", "on"
+        }
+        variant.available = available
+
+    variant.color = color
+    variant.description = description
+
+    files = [f for f in request.files.getlist("images") if f.filename]
+    saved_files = []
+
+    try:
+        for file in files:
+            filename = save_image(file)
+            if filename:
+                saved_files.append(filename)
+
+        for filename in saved_files:
+            db.session.add(
+                VariantImage(
+                    variant_id=vid,
+                    image_filename=filename
+                )
+            )
+
+        db.session.commit()
+        return jsonify(variant.public())
+
+    except ValueError as e:
+        db.session.rollback()
+        for filename in saved_files:
+            try:
+                os.remove(os.path.join(
+                    app.config["UPLOAD_FOLDER"], filename
+                ))
+            except OSError:
+                pass
+        return fail(str(e))
+
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Could not update product variant")
+        return fail("Could not update the colour variant.", 500)
+
+
+@app.delete("/api/admin/variants/<int:vid>")
+@owner_only
+def delete_variant(vid):
+    variant = db.session.get(ProductVariant, vid)
+    if not variant:
+        return fail("Colour variant not found.", 404)
+
+    filenames = [image.image_filename for image in variant.images]
+
+    db.session.delete(variant)
+    db.session.commit()
+
+    for filename in filenames:
+        try:
+            os.remove(os.path.join(
+                app.config["UPLOAD_FOLDER"], filename
+            ))
+        except OSError:
+            pass
+
+    return jsonify({"message": "Colour variant deleted."})
+
+
+@app.delete("/api/admin/variant-images/<int:image_id>")
+@owner_only
+def delete_variant_image(image_id):
+    image = db.session.get(VariantImage, image_id)
+    if not image:
+        return fail("Image not found.", 404)
+
+    # Keep at least one image for every variant.
+    if len(image.variant.images) <= 1:
+        return fail("A colour must have at least one image.")
+
+    filename = image.image_filename
+    db.session.delete(image)
+    db.session.commit()
+
+    try:
+        os.remove(os.path.join(
+            app.config["UPLOAD_FOLDER"], filename
+        ))
+    except OSError:
+        pass
+
+    return jsonify({"message": "Image removed."})
 @app.delete("/api/admin/products/<int:pid>")
 @owner_only
 def delete_product(pid):
     p = db.session.get(Product, pid)
     if not p:
         return fail("Product not found.", 404)
+
+    filenames = []
+
     if p.image_filename:
-        try: os.remove(os.path.join(app.config["UPLOAD_FOLDER"], p.image_filename))
-        except OSError: pass
-    db.session.delete(p); db.session.commit()
+        filenames.append(p.image_filename)
+
+    for variant in p.variants:
+        filenames.extend(
+            image.image_filename for image in variant.images
+        )
+
+    db.session.delete(p)
+    db.session.commit()
+
+    for filename in filenames:
+        try:
+            os.remove(os.path.join(
+                app.config["UPLOAD_FOLDER"], filename
+            ))
+        except OSError:
+            pass
+
     return jsonify({"message": "Product deleted."})
 
 @app.put("/api/admin/settings/whatsapp")
