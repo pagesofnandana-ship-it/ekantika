@@ -1,18 +1,55 @@
-import os, re
+
+import os
+import re
 from decimal import Decimal, InvalidOperation
 from functools import wraps
+
+import cloudinary
+import cloudinary.uploader
+
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager, create_access_token, get_jwt_identity, jwt_required
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    get_jwt_identity,
+    jwt_required,
+)
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy.engine import URL
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
 load_dotenv()
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
 app = Flask(__name__)
+
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-me")
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-me-too")
+
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+
+app.config["UPLOAD_FOLDER"] = os.path.join(BASE_DIR, "uploads")
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Cloudinary configuration
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True,
+)
+
+# Database configuration
 db_host = os.getenv("DB_HOST")
 
 if db_host:
@@ -29,35 +66,145 @@ if db_host:
     app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
         "connect_args": {
             "ssl": {
-                "ca": os.path.join(
-                    os.path.dirname(__file__), "ca.pem"
-                )
+                "ca": os.path.join(BASE_DIR, "ca.pem")
             }
         }
     }
 else:
     app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
         "DATABASE_URL",
-        "mysql+pymysql://root:password@localhost/ekantika_db?charset=utf8mb4"
+        "mysql+pymysql://root:password@localhost/ekantika_db?charset=utf8mb4",
     )
 
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": os.getenv(
+                "FRONTEND_ORIGIN",
+                "http://localhost:5173",
+            )
+        }
+    },
+)
 
-app.config["UPLOAD_FOLDER"] = os.path.join(BASE_DIR, "uploads")
-
-os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
-os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-CORS(app, resources={r"/api/*": {"origins": os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")}})
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+
 ALLOWED = {"jpg", "jpeg", "png", "webp"}
+CLOUDINARY_PREFIX = "cloudinary:"
+
+
+# --------------------------------------------------
+# IMAGE STORAGE HELPERS
+# --------------------------------------------------
+
+def get_image_url(filename):
+    """Return a usable URL for Cloudinary or legacy local images."""
+
+    if not filename:
+        return None
+
+    # New Cloudinary image
+    if filename.startswith(CLOUDINARY_PREFIX):
+        public_id = filename[len(CLOUDINARY_PREFIX):]
+
+        return cloudinary.CloudinaryImage(public_id).build_url(
+            secure=True
+        )
+
+    # Already stored as a complete URL
+    if filename.startswith(("https://", "http://")):
+        return filename
+
+    # Old local image
+    return f"/uploads/{filename}"
+
+
+def save_image(file):
+    """Upload an image to Cloudinary and store its public ID."""
+
+    if not file or not file.filename:
+        return None
+
+    ext = (
+        file.filename.rsplit(".", 1)[-1].lower()
+        if "." in file.filename
+        else ""
+    )
+
+    if ext not in ALLOWED:
+        raise ValueError("Use a JPG, PNG or WEBP image.")
+
+    if not (
+        os.getenv("CLOUDINARY_CLOUD_NAME")
+        and os.getenv("CLOUDINARY_API_KEY")
+        and os.getenv("CLOUDINARY_API_SECRET")
+    ):
+        raise ValueError("Cloudinary configuration is missing.")
+
+    try:
+        result = cloudinary.uploader.upload(
+            file,
+            folder="ekantika",
+            resource_type="image",
+            allowed_formats=["jpg", "jpeg", "png", "webp"],
+        )
+
+        public_id = result.get("public_id")
+
+        if not public_id:
+            raise ValueError("Cloudinary did not return an image ID.")
+
+        return CLOUDINARY_PREFIX + public_id
+
+    except Exception:
+        app.logger.exception("Cloudinary image upload failed")
+        raise ValueError(
+            "Image upload failed. Please try again."
+        )
+
+
+def delete_stored_image(filename):
+    """Delete Cloudinary images or old local files safely."""
+
+    if not filename:
+        return
+
+    try:
+        if filename.startswith(CLOUDINARY_PREFIX):
+            public_id = filename[len(CLOUDINARY_PREFIX):]
+
+            cloudinary.uploader.destroy(
+                public_id,
+                resource_type="image",
+            )
+
+        elif not filename.startswith(("https://", "http://")):
+            local_path = os.path.join(
+                app.config["UPLOAD_FOLDER"],
+                os.path.basename(filename),
+            )
+
+            if os.path.isfile(local_path):
+                os.remove(local_path)
+
+    except Exception:
+        app.logger.exception(
+            "Could not delete stored image: %s",
+            filename,
+        )
+
+
+# --------------------------------------------------
+# DATABASE MODELS
+# --------------------------------------------------
 
 class Admin(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
+
 
 class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -69,36 +216,50 @@ class Product(db.Model):
     color = db.Column(db.String(80), default="")
     image_filename = db.Column(db.String(255))
     available = db.Column(db.Boolean, default=True, nullable=False)
+
     variants = db.relationship(
         "ProductVariant",
         back_populates="product",
         cascade="all, delete-orphan",
-        lazy=True
+        lazy=True,
     )
+
     def public(self):
-        return {"id": self.id, "name": self.name, "price": float(self.price),
-                "description": self.description or "", "category": self.category or "Sarees",
-                "fabric": self.fabric or "", "color": self.color or "",
-                "image_url": f"/uploads/{self.image_filename}" if self.image_filename else None,
-                "available": self.available,
-                "variants": [variant.public() for variant in self.variants]}
+        return {
+            "id": self.id,
+            "name": self.name,
+            "price": float(self.price),
+            "description": self.description or "",
+            "category": self.category or "Sarees",
+            "fabric": self.fabric or "",
+            "color": self.color or "",
+            "image_url": get_image_url(self.image_filename),
+            "available": self.available,
+            "variants": [
+                variant.public() for variant in self.variants
+            ],
+        }
+
+
 class ProductVariant(db.Model):
     __tablename__ = "product_variants"
 
     id = db.Column(db.Integer, primary_key=True)
+
     product_id = db.Column(
         db.Integer,
         db.ForeignKey("product.id", ondelete="CASCADE"),
         nullable=False,
-        index=True
+        index=True,
     )
+
     color = db.Column(db.String(80), nullable=False)
     description = db.Column(db.Text, default="")
     available = db.Column(db.Boolean, default=True, nullable=False)
 
     product = db.relationship(
         "Product",
-        back_populates="variants"
+        back_populates="variants",
     )
 
     images = db.relationship(
@@ -106,7 +267,7 @@ class ProductVariant(db.Model):
         back_populates="variant",
         cascade="all, delete-orphan",
         order_by="VariantImage.id",
-        lazy=True
+        lazy=True,
     )
 
     def public(self):
@@ -119,10 +280,10 @@ class ProductVariant(db.Model):
             "images": [
                 {
                     "id": image.id,
-                    "image_url": f"/uploads/{image.image_filename}"
+                    "image_url": get_image_url(image.image_filename),
                 }
                 for image in self.images
-            ]
+            ],
         }
 
 
@@ -130,171 +291,319 @@ class VariantImage(db.Model):
     __tablename__ = "variant_images"
 
     id = db.Column(db.Integer, primary_key=True)
+
     variant_id = db.Column(
         db.Integer,
         db.ForeignKey("product_variants.id", ondelete="CASCADE"),
         nullable=False,
-        index=True
+        index=True,
     )
+
     image_filename = db.Column(db.String(255), nullable=False)
 
     variant = db.relationship(
         "ProductVariant",
-        back_populates="images"
+        back_populates="images",
     )
+
+
 class Setting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(db.String(80), unique=True, nullable=False)
     value = db.Column(db.String(255), default="", nullable=False)
 
+
+# --------------------------------------------------
+# DATABASE INITIALIZATION
+# --------------------------------------------------
+
 with app.app_context():
     db.create_all()
-    if not Setting.query.filter_by(key="whatsapp_number").first():
-        db.session.add(Setting(key="whatsapp_number", value=os.getenv("WHATSAPP_NUMBER", "")))
+
+    if not Setting.query.filter_by(
+        key="whatsapp_number"
+    ).first():
+        db.session.add(
+            Setting(
+                key="whatsapp_number",
+                value=os.getenv("WHATSAPP_NUMBER", ""),
+            )
+        )
         db.session.commit()
+
+
+# --------------------------------------------------
+# COMMON HELPERS
+# --------------------------------------------------
 
 def fail(message, status=400):
     return jsonify({"error": message}), status
+
 
 def owner_only(fn):
     @wraps(fn)
     @jwt_required()
     def wrapped(*args, **kwargs):
         try:
-            admin = db.session.get(Admin, int(get_jwt_identity()))
+            admin = db.session.get(
+                Admin,
+                int(get_jwt_identity()),
+            )
         except (TypeError, ValueError):
             admin = None
+
         if not admin:
             return fail("Admin login required.", 401)
+
         return fn(*args, **kwargs)
+
     return wrapped
 
+
 def current_whatsapp():
-    row = Setting.query.filter_by(key="whatsapp_number").first()
+    row = Setting.query.filter_by(
+        key="whatsapp_number"
+    ).first()
+
     return row.value if row else ""
+
 
 def parse_fields(data):
     name = str(data.get("name", "")).strip()
+
     if not name:
         raise ValueError("Product name is required.")
+
     try:
         price = Decimal(str(data.get("price", "")).strip())
+
         if price < 0:
             raise InvalidOperation
+
     except (InvalidOperation, ValueError):
         raise ValueError("Enter a valid non-negative price.")
-    return dict(name=name, price=price,
-                description=str(data.get("description", "")).strip(),
-                category=str(data.get("category", "Sarees")).strip() or "Sarees",
-                fabric=str(data.get("fabric", "")).strip(),
-                color=str(data.get("color", "")).strip(),
-                available=str(data.get("available", "true")).lower() in {"true", "1", "yes", "on"})
 
-def save_image(file):
-    if not file or not file.filename:
-        return None
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext not in ALLOWED:
-        raise ValueError("Use a JPG, PNG or WEBP image.")
-    filename = os.urandom(8).hex() + "_" + secure_filename(file.filename)
-    file.save(os.path.join(app.config["UPLOAD_FOLDER"], filename))
-    return filename
+    return {
+        "name": name,
+        "price": price,
+        "description": str(
+            data.get("description", "")
+        ).strip(),
+        "category": str(
+            data.get("category", "Sarees")
+        ).strip() or "Sarees",
+        "fabric": str(data.get("fabric", "")).strip(),
+        "color": str(data.get("color", "")).strip(),
+        "available": str(
+            data.get("available", "true")
+        ).lower() in {"true", "1", "yes", "on"},
+    }
+
+
+# --------------------------------------------------
+# PUBLIC API ROUTES
+# --------------------------------------------------
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "store": "Ekantika"})
+    return jsonify({
+        "status": "ok",
+        "store": "Ekantika",
+    })
+
 
 @app.get("/api/settings")
 def settings():
-    return jsonify({"store_name": "Ekantika", "whatsapp_number": current_whatsapp()})
+    return jsonify({
+        "store_name": "Ekantika",
+        "whatsapp_number": current_whatsapp(),
+    })
+
 
 @app.get("/api/products")
 def products():
     q = Product.query
+
     search = request.args.get("search", "").strip()
     category = request.args.get("category", "")
+
     if search:
         term = f"%{search}%"
-        q = q.filter(db.or_(Product.name.ilike(term), Product.description.ilike(term),
-                            Product.category.ilike(term), Product.fabric.ilike(term)))
+
+        q = q.filter(
+            db.or_(
+                Product.name.ilike(term),
+                Product.description.ilike(term),
+                Product.category.ilike(term),
+                Product.fabric.ilike(term),
+            )
+        )
+
     if category and category.lower() != "all":
         q = q.filter_by(category=category)
+
     if request.args.get("available") != "all":
         q = q.filter_by(available=True)
-    return jsonify([p.public() for p in q.order_by(Product.id.desc()).all()])
+
+    result = q.order_by(Product.id.desc()).all()
+
+    return jsonify([product.public() for product in result])
+
 
 @app.get("/api/products/<int:pid>")
 def product_detail(pid):
-    p = db.session.get(Product, pid)
-    return (jsonify(p.public()), 200) if p else fail("Product not found.", 404)
+    product = db.session.get(Product, pid)
+
+    if not product:
+        return fail("Product not found.", 404)
+
+    return jsonify(product.public()), 200
+
+
+# --------------------------------------------------
+# ADMIN AUTHENTICATION
+# --------------------------------------------------
 
 @app.post("/api/auth/login")
 def login():
     data = request.get_json(silent=True) or {}
-    admin = Admin.query.filter_by(username=str(data.get("username", "")).strip()).first()
-    if not admin or not check_password_hash(admin.password_hash, data.get("password", "")):
+
+    admin = Admin.query.filter_by(
+        username=str(data.get("username", "")).strip()
+    ).first()
+
+    if not admin or not check_password_hash(
+        admin.password_hash,
+        data.get("password", ""),
+    ):
         return fail("Invalid username or password.", 401)
-    return jsonify({"access_token": create_access_token(identity=str(admin.id)), "username": admin.username})
+
+    return jsonify({
+        "access_token": create_access_token(
+            identity=str(admin.id)
+        ),
+        "username": admin.username,
+    })
+
+
+# --------------------------------------------------
+# PRODUCT MANAGEMENT
+# --------------------------------------------------
 
 @app.post("/api/admin/products")
 @owner_only
 def add_product():
     try:
-        fields = parse_fields(request.form if request.form else (request.get_json(silent=True) or {}))
+        fields = parse_fields(
+            request.form
+            if request.form
+            else (request.get_json(silent=True) or {})
+        )
+
         filename = save_image(request.files.get("image"))
+
+        product = Product(
+            **fields,
+            image_filename=filename,
+        )
+
+        db.session.add(product)
+        db.session.commit()
+
+        return jsonify(product.public()), 201
+
     except ValueError as e:
+        db.session.rollback()
         return fail(str(e))
-    p = Product(**fields, image_filename=filename)
-    db.session.add(p); db.session.commit()
-    return jsonify(p.public()), 201
+
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Could not create product")
+        return fail("Could not save the product.", 500)
+
 
 @app.put("/api/admin/products/<int:pid>")
 @owner_only
 def edit_product(pid):
-    p = db.session.get(Product, pid)
-    if not p:
+    product = db.session.get(Product, pid)
+
+    if not product:
         return fail("Product not found.", 404)
+
     try:
-        fields = parse_fields(request.form if request.form else (request.get_json(silent=True) or {}))
-        filename = save_image(request.files.get("image"))
+        fields = parse_fields(
+            request.form
+            if request.form
+            else (request.get_json(silent=True) or {})
+        )
+
+        new_filename = save_image(
+            request.files.get("image")
+        )
+
+        old_filename = product.image_filename
+
+        for key, value in fields.items():
+            setattr(product, key, value)
+
+        if new_filename:
+            product.image_filename = new_filename
+
+        db.session.commit()
+
+        if new_filename and old_filename:
+            delete_stored_image(old_filename)
+
+        return jsonify(product.public())
+
     except ValueError as e:
+        db.session.rollback()
         return fail(str(e))
-    for k, v in fields.items():
-        setattr(p, k, v)
-    if filename:
-        old = p.image_filename
-        p.image_filename = filename
-        if old:
-            try: os.remove(os.path.join(app.config["UPLOAD_FOLDER"], old))
-            except OSError: pass
-    db.session.commit()
-    return jsonify(p.public())
+
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Could not update product")
+        return fail("Could not update the product.", 500)
+
+
+# --------------------------------------------------
+# PRODUCT VARIANTS
+# --------------------------------------------------
+
 @app.post("/api/admin/products/<int:pid>/variants")
 @owner_only
 def add_variant(pid):
     product = db.session.get(Product, pid)
+
     if not product:
         return fail("Product not found.", 404)
 
     color = request.form.get("color", "").strip()
     description = request.form.get("description", "").strip()
-    available = request.form.get("available", "true").lower() in {
-        "true", "1", "yes", "on"
-    }
+
+    available = request.form.get(
+        "available", "true"
+    ).lower() in {"true", "1", "yes", "on"}
 
     if not color:
         return fail("Colour name is required.")
 
-    files = [f for f in request.files.getlist("images") if f.filename]
+    files = [
+        file for file in request.files.getlist("images")
+        if file.filename
+    ]
 
     if not files:
-        return fail("Upload at least one image for this colour.")
+        return fail(
+            "Upload at least one image for this colour."
+        )
 
     saved_files = []
 
     try:
         for file in files:
             filename = save_image(file)
+
             if filename:
                 saved_files.append(filename)
 
@@ -302,8 +611,9 @@ def add_variant(pid):
             product_id=pid,
             color=color,
             description=description,
-            available=available
+            available=available,
         )
+
         db.session.add(variant)
         db.session.flush()
 
@@ -311,67 +621,77 @@ def add_variant(pid):
             db.session.add(
                 VariantImage(
                     variant_id=variant.id,
-                    image_filename=filename
+                    image_filename=filename,
                 )
             )
 
         db.session.commit()
+
         return jsonify(variant.public()), 201
 
     except ValueError as e:
         db.session.rollback()
+
         for filename in saved_files:
-            try:
-                os.remove(os.path.join(
-                    app.config["UPLOAD_FOLDER"], filename
-                ))
-            except OSError:
-                pass
+            delete_stored_image(filename)
+
         return fail(str(e))
 
     except Exception:
         db.session.rollback()
+
         for filename in saved_files:
-            try:
-                os.remove(os.path.join(
-                    app.config["UPLOAD_FOLDER"], filename
-                ))
-            except OSError:
-                pass
-        app.logger.exception("Could not create product variant")
-        return fail("Could not save the colour variant.", 500)
+            delete_stored_image(filename)
+
+        app.logger.exception(
+            "Could not create product variant"
+        )
+
+        return fail(
+            "Could not save the colour variant.",
+            500,
+        )
 
 
 @app.put("/api/admin/variants/<int:vid>")
 @owner_only
 def edit_variant(vid):
     variant = db.session.get(ProductVariant, vid)
+
     if not variant:
         return fail("Colour variant not found.", 404)
 
-    color = request.form.get("color", variant.color).strip()
+    color = request.form.get(
+        "color", variant.color
+    ).strip()
+
     description = request.form.get(
-        "description", variant.description or ""
+        "description",
+        variant.description or "",
     ).strip()
 
     if not color:
         return fail("Colour name is required.")
 
     if "available" in request.form:
-        available = request.form["available"].lower() in {
-            "true", "1", "yes", "on"
-        }
-        variant.available = available
+        variant.available = request.form[
+            "available"
+        ].lower() in {"true", "1", "yes", "on"}
 
     variant.color = color
     variant.description = description
 
-    files = [f for f in request.files.getlist("images") if f.filename]
+    files = [
+        file for file in request.files.getlist("images")
+        if file.filename
+    ]
+
     saved_files = []
 
     try:
         for file in files:
             filename = save_image(file)
+
             if filename:
                 saved_files.append(filename)
 
@@ -379,136 +699,209 @@ def edit_variant(vid):
             db.session.add(
                 VariantImage(
                     variant_id=vid,
-                    image_filename=filename
+                    image_filename=filename,
                 )
             )
 
         db.session.commit()
+
         return jsonify(variant.public())
 
     except ValueError as e:
         db.session.rollback()
+
         for filename in saved_files:
-            try:
-                os.remove(os.path.join(
-                    app.config["UPLOAD_FOLDER"], filename
-                ))
-            except OSError:
-                pass
+            delete_stored_image(filename)
+
         return fail(str(e))
 
     except Exception:
         db.session.rollback()
-        app.logger.exception("Could not update product variant")
-        return fail("Could not update the colour variant.", 500)
+
+        for filename in saved_files:
+            delete_stored_image(filename)
+
+        app.logger.exception(
+            "Could not update product variant"
+        )
+
+        return fail(
+            "Could not update the colour variant.",
+            500,
+        )
 
 
 @app.delete("/api/admin/variants/<int:vid>")
 @owner_only
 def delete_variant(vid):
     variant = db.session.get(ProductVariant, vid)
+
     if not variant:
         return fail("Colour variant not found.", 404)
 
-    filenames = [image.image_filename for image in variant.images]
+    filenames = [
+        image.image_filename for image in variant.images
+    ]
 
     db.session.delete(variant)
     db.session.commit()
 
     for filename in filenames:
-        try:
-            os.remove(os.path.join(
-                app.config["UPLOAD_FOLDER"], filename
-            ))
-        except OSError:
-            pass
+        delete_stored_image(filename)
 
-    return jsonify({"message": "Colour variant deleted."})
+    return jsonify({
+        "message": "Colour variant deleted."
+    })
 
 
 @app.delete("/api/admin/variant-images/<int:image_id>")
 @owner_only
 def delete_variant_image(image_id):
     image = db.session.get(VariantImage, image_id)
+
     if not image:
         return fail("Image not found.", 404)
 
-    # Keep at least one image for every variant.
     if len(image.variant.images) <= 1:
-        return fail("A colour must have at least one image.")
+        return fail(
+            "A colour must have at least one image."
+        )
 
     filename = image.image_filename
+
     db.session.delete(image)
     db.session.commit()
 
-    try:
-        os.remove(os.path.join(
-            app.config["UPLOAD_FOLDER"], filename
-        ))
-    except OSError:
-        pass
+    delete_stored_image(filename)
 
-    return jsonify({"message": "Image removed."})
+    return jsonify({
+        "message": "Image removed."
+    })
+
+
+# --------------------------------------------------
+# DELETE PRODUCT
+# --------------------------------------------------
+
 @app.delete("/api/admin/products/<int:pid>")
 @owner_only
 def delete_product(pid):
-    p = db.session.get(Product, pid)
-    if not p:
+    product = db.session.get(Product, pid)
+
+    if not product:
         return fail("Product not found.", 404)
 
     filenames = []
 
-    if p.image_filename:
-        filenames.append(p.image_filename)
+    if product.image_filename:
+        filenames.append(product.image_filename)
 
-    for variant in p.variants:
+    for variant in product.variants:
         filenames.extend(
-            image.image_filename for image in variant.images
+            image.image_filename
+            for image in variant.images
         )
 
-    db.session.delete(p)
+    db.session.delete(product)
     db.session.commit()
 
     for filename in filenames:
-        try:
-            os.remove(os.path.join(
-                app.config["UPLOAD_FOLDER"], filename
-            ))
-        except OSError:
-            pass
+        delete_stored_image(filename)
 
-    return jsonify({"message": "Product deleted."})
+    return jsonify({
+        "message": "Product deleted."
+    })
+
+
+# --------------------------------------------------
+# WHATSAPP SETTINGS
+# --------------------------------------------------
 
 @app.put("/api/admin/settings/whatsapp")
 @owner_only
 def update_whatsapp():
     data = request.get_json(silent=True) or {}
-    number = re.sub(r"\D", "", str(data.get("whatsapp_number", "")))
+
+    number = re.sub(
+        r"\D",
+        "",
+        str(data.get("whatsapp_number", "")),
+    )
+
     if number and not 8 <= len(number) <= 15:
-        return fail("Enter a valid international number with country code.")
-    row = Setting.query.filter_by(key="whatsapp_number").first()
+        return fail(
+            "Enter a valid international number with country code."
+        )
+
+    row = Setting.query.filter_by(
+        key="whatsapp_number"
+    ).first()
+
     if not row:
-        db.session.add(Setting(key="whatsapp_number", value=number))
+        db.session.add(
+            Setting(
+                key="whatsapp_number",
+                value=number,
+            )
+        )
     else:
         row.value = number
+
     db.session.commit()
-    return jsonify({"whatsapp_number": number})
+
+    return jsonify({
+        "whatsapp_number": number
+    })
+
+
+# --------------------------------------------------
+# LEGACY LOCAL IMAGE ROUTE
+# --------------------------------------------------
 
 @app.get("/uploads/<path:filename>")
 def uploaded(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"],
+        filename,
+    )
+
+
+# --------------------------------------------------
+# CREATE ADMIN COMMAND
+# --------------------------------------------------
 
 @app.cli.command("create-admin")
 def create_admin():
     username = input("Admin username: ").strip()
-    password = input("Admin password (minimum 10 characters): ")
+
+    password = input(
+        "Admin password (minimum 10 characters): "
+    )
+
     if not username or len(password) < 10:
-        print("Username is required; password must be at least 10 characters."); return
+        print(
+            "Username is required; password must be at least 10 characters."
+        )
+        return
+
     if Admin.query.filter_by(username=username).first():
-        print("Username already exists."); return
-    admin = Admin(username=username, password_hash=generate_password_hash(password))
-    db.session.add(admin); db.session.commit()
+        print("Username already exists.")
+        return
+
+    admin = Admin(
+        username=username,
+        password_hash=generate_password_hash(password),
+    )
+
+    db.session.add(admin)
+    db.session.commit()
+
     print("Admin created successfully.")
+
+
+# --------------------------------------------------
+# RUN APPLICATION
+# --------------------------------------------------
 
 if __name__ == "__main__":
     app.run(debug=True)
